@@ -8,6 +8,7 @@ from threading import local
 from functools import wraps
 from weakref import WeakValueDictionary
 
+import django
 from django.conf import settings
 from django.core.signals import request_finished
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
@@ -421,7 +422,7 @@ class SearchEngine(object):
             model = model,
         ))
 
-    def _get_entries_for_obj(self, obj):
+    def _get_entries_for_obj(self, obj, lang=''):
         """Returns a queryset of entries associate with the given obj."""
         from django.contrib.contenttypes.models import ContentType
         from watson.models import SearchEntry, has_int_pk
@@ -433,6 +434,8 @@ class SearchEngine(object):
             content_type = content_type,
             engine_slug = self._engine_slug,
         )
+        # Get entries in terms of language
+        search_entries = search_entries.filter(lang = lang)
         if has_int_pk(model):
             # Do a fast indexed lookup.
             object_id_int = int(obj.pk)
@@ -447,7 +450,7 @@ class SearchEngine(object):
             )
         return object_id_int, search_entries
 
-    def _update_obj_index_iter(self, obj):
+    def _update_obj_index_iter(self, obj, lang=''):
         """Either updates the given object index, or yields an unsaved search entry."""
         from django.contrib.contenttypes.models import ContentType
         from watson.models import SearchEntry
@@ -463,9 +466,10 @@ class SearchEngine(object):
             "content": adapter.get_content(obj),
             "url": adapter.get_url(obj),
             "meta_encoded": adapter.serialize_meta(obj),
+            "lang": lang,
         }
         # Try to get the existing search entry.
-        object_id_int, search_entries = self._get_entries_for_obj(obj)
+        object_id_int, search_entries = self._get_entries_for_obj(obj, lang)
         # Attempt to update the search entries.
         update_count = search_entries.update(**search_entry_data)
         if update_count == 0:
@@ -570,9 +574,40 @@ class SearchEngine(object):
         # Perform the backend-specific full text match.
         backend = get_backend(backend_name=backend_name)
         queryset = backend.do_search(self._engine_slug, queryset, search_text)
+        # Remove duplicates with 'DISTINCT ON'
+        should_group_by = False
+        if django.db.connection.vendor=='postgresql':
+            # PostgreSQL ONLY
+            # When you specify field names, you must provide an order_by() in the QuerySet,
+            # and the fields in order_by() must start with the fields in distinct(), in the same order.
+            # IGNORE the case with object_id
+            pks = queryset.order_by('content_type', 'object_id_int').distinct('content_type', 'object_id_int')\
+                .values_list('pk', flat=True)
+            queryset = queryset.filter(pk__in=pks)
+        else:
+            should_group_by = True
         # Perform the backend-specific full-text ranking.
         if ranking:
             queryset = backend.do_search_ranking(self._engine_slug, queryset, search_text)
+        # Remove duplicates with 'GROUP BY'
+        if should_group_by:
+            query = queryset.query
+            sql_tpl, params = query.sql_with_params()
+            wrapped_params = []
+            for param in params:
+                if isinstance(param, basestring):
+                    # TODO encoding problem cannot repr the raw queryset
+                    param = "'{}'".format(param)
+                wrapped_params.append(param)
+            raw_sql = sql_tpl % tuple(wrapped_params)
+            # TODO need to be more robust
+            # otherwise the limitation is
+            raw_sql += ' GROUP BY "{model_table}"."{content_type_column}", "{model_table}"."{object_id_int_column}"'\
+                .format(**{'model_table':SearchEntry._meta.db_table,
+                           'content_type_column':SearchEntry._meta.get_field('content_type').column,
+                           'object_id_int_column': SearchEntry._meta.get_field('object_id_int').column,
+                           })
+            queryset = SearchEntry.objects.raw(raw_sql)
         # Return the complete queryset.
         return queryset
 
@@ -597,10 +632,34 @@ class SearchEngine(object):
         # Return the complete queryset.
         return queryset
 
+try:
+    from modeltranslation.translator import translator
+    from django.utils import translation
 
-# The default search engine.
-default_search_engine = SearchEngine("default")
+    class MultiligualSearchEngine(SearchEngine):
 
+        def _update_obj_index_iter(self, obj):
+            klass = obj.__class__
+            curr_lang = translation.get_language()
+            try:
+                if klass in translator.get_registered_models():
+                    # make sure doc in default language has highest priority
+                    langs = list(zip(*settings.LANGUAGES)[0])
+                    langs.remove(settings.LANGUAGE_CODE)
+                    langs.append(settings.LANGUAGE_CODE)
+                else:
+                    langs = [curr_lang]
+                for lang in langs:
+                    translation.activate(lang)
+                    for ret in super(MultiligualSearchEngine, self)._update_obj_index_iter(obj, lang):
+                        yield ret
+            finally:
+                translation.activate(curr_lang)
+
+    default_search_engine = MultiligualSearchEngine("default")
+except ImportError:
+    # The default search engine.
+    default_search_engine = SearchEngine("default")
 
 # The cache for the initialized backend.
 _backends_cache = {}

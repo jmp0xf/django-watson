@@ -53,6 +53,12 @@ class SearchEntry(models.Model):
 
     object = GenericForeignKey()
 
+    lang = models.CharField(
+        max_length=10,
+        default='',
+        blank=True,
+    )
+
     title = models.CharField(
         max_length = 1000,
     )
