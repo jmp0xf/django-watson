@@ -616,6 +616,23 @@ class SearchEngine(object):
         # Return the complete queryset.
         return queryset
 
+    def distinct_search(self, search_text, models=(), exclude=(), ranking=True, backend_name=None, lang=None, num=30):
+        queryset = self.search(search_text, models=models, exclude=exclude, ranking=ranking, backend_name=backend_name, distinct=False, lang=None)
+        results = {}
+        distinct_list = []
+        for index, result in enumerate(queryset[:num]):
+            object_id = result.object_id
+            content_type_id = result.content_type_id
+            id = '{}__{}'.format(content_type_id, object_id)
+            if id in results:
+                if result.lang == lang or result.lang == settings.LANGUAGE_CODE and results[id]['lang'] != lang:
+                    distinct_list[results[id]['index']] = result
+                    results[id]['lang'] = result.lang
+            else:
+                distinct_list.append(result)
+                results[id] = {'lang': result.lang, 'index': len(distinct_list)-1}
+        return distinct_list
+
     def filter(self, queryset, search_text, ranking=True, backend_name=None):
         """
         Filters the given model or queryset using the given text, returning the
@@ -696,6 +713,7 @@ def get_backend(backend_name=None):
 
 # The main search methods.
 search = default_search_engine.search
+distinct_search = default_search_engine.distinct_search
 filter = default_search_engine.filter
 
 
