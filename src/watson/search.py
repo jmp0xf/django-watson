@@ -554,7 +554,7 @@ class SearchEngine(object):
                 else:
                     yield queryset.all()
 
-    def search(self, search_text, models=(), exclude=(), ranking=True, backend_name=None):
+    def search(self, search_text, models=(), exclude=(), ranking=True, backend_name=None, distinct=True, lang=None):
         """Performs a search using the given text, returning a queryset of SearchEntry."""
         from watson.models import SearchEntry
         # Check for blank search text.
@@ -574,18 +574,23 @@ class SearchEngine(object):
         # Perform the backend-specific full text match.
         backend = get_backend(backend_name=backend_name)
         queryset = backend.do_search(self._engine_slug, queryset, search_text)
+
+        if lang:
+            queryset = queryset.filter(lang=lang)
+
         # Remove duplicates with 'DISTINCT ON'
         should_group_by = False
-        if django.db.connection.vendor=='postgresql':
-            # PostgreSQL ONLY
-            # When you specify field names, you must provide an order_by() in the QuerySet,
-            # and the fields in order_by() must start with the fields in distinct(), in the same order.
-            # IGNORE the case with object_id
-            pks = queryset.order_by('content_type', 'object_id_int').distinct('content_type', 'object_id_int')\
-                .values_list('pk', flat=True)
-            queryset = queryset.filter(pk__in=pks)
-        else:
-            should_group_by = True
+        if distinct:
+            if django.db.connection.vendor=='postgresql':
+                # PostgreSQL ONLY
+                # When you specify field names, you must provide an order_by() in the QuerySet,
+                # and the fields in order_by() must start with the fields in distinct(), in the same order.
+                # IGNORE the case with object_id
+                pks = queryset.order_by('content_type', 'object_id_int').distinct('content_type', 'object_id_int')\
+                    .values_list('pk', flat=True)
+                queryset = queryset.filter(pk__in=pks)
+            else:
+                should_group_by = True
         # Perform the backend-specific full-text ranking.
         if ranking:
             queryset = backend.do_search_ranking(self._engine_slug, queryset, search_text)
